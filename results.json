@@ -17,7 +17,7 @@
     "avg_length": 200.0
   },
   "latency_stats": {
-    "avg_inference_time": 25.442710876464844
+    "avg_inference_time": 25.31340789794922
   },
   "streaming_stats": {
     "avg_AL": 4.75,
