@@ -1,0 +1,106 @@
+# Ubuntu系统运行指南
+
+## 📋 完整实验流程（Ubuntu系统）
+
+### Step 0: 环境准备
+
+```bash
+# 1. 检查Python版本（需要3.8+）
+python3 --version
+
+# 2. 检查GPU（如果使用）
+nvidia-smi
+
+# 3. 检查环境依赖
+python3 check_environment.py
+
+# 4. 安装Python依赖
+pip3 install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+# 或
+python3 -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+### Step 1: 下载模型
+
+```bash
+# 方式1: 使用下载脚本（推荐，自动使用ModelScope）
+bash scripts/ubuntu/download_models.sh
+
+# 方式2: 直接使用Python脚本（Python 3.9+，优先使用ModelScope）
+python3 download_models_china.py --model all --use-modelscope
+
+# 方式3: Python 3.8（自动尝试ModelScope）
+python3 download_models_python38.py --model all
+
+# 单独下载某个模型
+python3 download_models_china.py --model Llama3-8B-Instruct --use-modelscope
+python3 download_models_china.py --model Gemma2-9B-Instruct --use-modelscope
+```
+
+**注意**: 新版本脚本优先使用ModelScope（国内访问快，无需认证）
+
+**验证模型**:
+```bash
+python3 check_model_integrity.py ./models/Qwen2.5-3B-Instruct
+```
+
+### Step 2: 测试Baseline
+
+```bash
+# 基础功能测试
+python3 test_baselines.py
+
+# 小样本真实模型测试（H2O）
+python3 StreamingLLM_GPE/evaluate/multi_model_eval.py \
+    --LLM_backbone Qwen \
+    --LLM_path ./models/Qwen2.5-3B-Instruct \
+    --use_h2o \
+    --h2o_budget 2048 \
+    --output_dir ./output_logs/test_h2o \
+    --max_samples 2 \
+    --quantization 4bit
+
+# 小样本真实模型测试（StreamingLLM）
+python3 StreamingLLM_GPE/evaluate/multi_model_eval.py \
+    --LLM_backbone Qwen \
+    --LLM_path ./models/Qwen2.5-3B-Instruct \
+    --use_streamingllm \
+    --streamingllm_window 512 \
+    --output_dir ./output_logs/test_streamingllm \
+    --max_samples 2 \
+    --quantization 4bit
+```
+
+### Step 3: 运行完整实验
+
+```bash
+# 运行A级论文完整实验
+bash scripts/ubuntu/run_a_level_experiments.sh
+```
+
+### Step 4: 分析结果
+
+```bash
+# 分析实验结果
+python3 analyze_experiment_results.py \
+    --output_dir ./output_logs/a_level_paper/long_seq_10000 \
+    --detailed \
+    --save_csv ./output_logs/summary.csv
+
+# 生成可视化
+python3 visualize_results.py \
+    --results_dir ./output_logs/a_level_paper \
+    --output_dir ./output_logs/figures
+```
+
+## 📝 脚本说明
+
+- `download_models.sh` - 模型下载脚本
+- `run_a_level_experiments.sh` - A级论文完整实验脚本
+
+## ⚠️ 注意事项
+
+1. 确保使用`python3`命令（不是`python`）
+2. 如果pip命令找不到，使用`python3 -m pip`
+3. 确保有足够的磁盘空间（至少50GB）
+
