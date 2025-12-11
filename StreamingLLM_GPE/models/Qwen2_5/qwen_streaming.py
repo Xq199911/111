@@ -830,13 +830,20 @@ class Qwen2Model_stream(Qwen2Model):
                 use_cache = False
 
         use_legacy_cache = False
-        if use_cache and not isinstance(past_key_values, Cache) and not self.training:
-            use_legacy_cache = True
-            past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-            logger.warning_once(
-                "We detected that you are passing `past_key_values` as a tuple and this is deprecated and will be removed in v4.43. "
-                "Please use an appropriate `Cache` class (https://huggingface.co/docs/transformers/v4.41.3/en/internal/generation_utils#transformers.Cache)"
-            )
+        # [Fix] 强制信任传入的 cache 对象，防止 H2OCache 被意外转换为 DynamicCache
+        # 只要对象拥有 update 方法，我们就认为它是一个有效的 Cache 对象
+        if use_cache and past_key_values is not None and not self.training:
+            if hasattr(past_key_values, 'update'):
+                # 这是我们的自定义 Cache (H2O/StreamingLLM)，直接使用，不要转换！
+                use_legacy_cache = False
+            elif not isinstance(past_key_values, Cache):
+                # 只有当它真的是 Tuple 且不是我们的 Cache 时，才进行转换
+                use_legacy_cache = True
+                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+                logger.warning_once(
+                    "We detected that you are passing `past_key_values` as a tuple and this is deprecated and will be removed in v4.43. "
+                    "Please use an appropriate `Cache` class (https://huggingface.co/docs/transformers/v4.41.3/en/internal/generation_utils#transformers.Cache)"
+                )
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
