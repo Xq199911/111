@@ -967,6 +967,16 @@ def main():
     )
 
     # 记录配置
+    # 确定显示的预算值
+    if args.use_h2o:
+        budget_display = f"{args.h2o_budget} tokens/layer (H2O)"
+    elif args.use_streamingllm:
+        budget_display = f"{args.streamingllm_window} tokens (StreamingLLM window)"
+    elif args.use_head_aware:
+        budget_display = f"{args.total_budget} tokens/layer (Head-Aware)"
+    else:
+        budget_display = f"{args.total_budget} tokens/layer (default)"
+    
     config_str = f"""
     Multi-Model Evaluation Configuration:
     - Model Architecture: {args.LLM_backbone}
@@ -974,11 +984,14 @@ def main():
     - Inference Mode: {args.inference_mode}
     - Head-Aware: {args.use_head_aware}
     - Group-Aware: {args.use_group_aware}
-    - Total Budget: {args.total_budget} tokens/layer
+    - H2O: {args.use_h2o}
+    - StreamingLLM: {args.use_streamingllm}
+    - Cache Budget: {budget_display}
     - Max Memory: {args.max_memory_gb} GB
     - Wait-k: {args.wait_k}
     - Min Source Length: {args.min_source_length}
     - Max Samples: {args.max_samples}
+    - Max New Tokens: {args.max_new_tokens}
     """
     print(config_str)
     logging.info(config_str)
@@ -1068,15 +1081,57 @@ def main():
     )
 
     data_collator_dataset = data_collator.dataset_loader()
+    
+    # 记录初始数据集大小
+    initial_size = len(data_collator_dataset)
+    logging.info(f"Loaded dataset with {initial_size} samples from {params.file_path}")
+    
+    if initial_size == 0:
+        logging.error(f"No samples found in data file: {params.file_path}")
+        raise ValueError(f"No samples available in data file: {params.file_path}. Please check the file path and format.")
 
     # 过滤短序列（如果指定了最小长度）
     if args.min_source_length > 0:
         def filter_long_sequences(example):
-            source_words = example.get("source_txt", "").split()
+            source_txt = example.get("source_txt", "")
+            if not source_txt:
+                return False
+            source_words = source_txt.split()
             return len(source_words) >= args.min_source_length
 
+        before_filter_size = len(data_collator_dataset)
         data_collator_dataset = data_collator_dataset.filter(filter_long_sequences)
-        logging.info(f"Filtered dataset: keeping sequences with >= {args.min_source_length} source words")
+        after_filter_size = len(data_collator_dataset)
+        logging.info(f"Filtered dataset: {before_filter_size} -> {after_filter_size} samples (keeping sequences with >= {args.min_source_length} source words)")
+        
+        if after_filter_size == 0:
+            # 提供更详细的诊断信息
+            logging.warning(f"All samples were filtered out! Checking sample lengths...")
+            # 检查前几个样本的长度
+            sample_lengths = []
+            for i, example in enumerate(data_collator.dataset_loader()):
+                if i >= 5:  # 只检查前5个样本
+                    break
+                source_txt = example.get("source_txt", "")
+                if source_txt:
+                    word_count = len(source_txt.split())
+                    sample_lengths.append(word_count)
+            
+            if sample_lengths:
+                max_length = max(sample_lengths)
+                avg_length = sum(sample_lengths) / len(sample_lengths)
+                logging.error(f"Sample word counts (first {len(sample_lengths)}): {sample_lengths}")
+                logging.error(f"Max length: {max_length}, Average length: {avg_length:.1f}")
+                logging.error(f"Required minimum: {args.min_source_length}")
+                logging.error(f"Try reducing --min_source_length (e.g., --min_source_length {max(100, int(avg_length))})")
+            else:
+                logging.error("Could not read sample lengths. Check data file format.")
+            
+            raise ValueError(
+                f"No samples available after filtering with min_source_length={args.min_source_length}. "
+                f"Original dataset size: {before_filter_size}. "
+                f"Try reducing --min_source_length or check your data file."
+            )
 
     # 限制样本数量（用于测试）
     original_size = len(data_collator_dataset)
@@ -1160,22 +1215,37 @@ def main():
 
         # 应用Chat Template并重新Tokenize
         if "Instruct" in args.LLM_path or "Chat" in args.LLM_path:
-            # 构建对话格式
-            new_source_txt = []
-            for s in source_txt:
-                messages = [
-                    {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": s}
-                ]
-                text = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True
-                )
-                new_source_txt.append(text)
+            # 如果原始文本已经包含 <|im_start|> / <|im_end|> 等标记，则视为已构造好对话格式，直接使用
+            contains_chat_tokens = any("<|im_start|>" in s or "<|im_end|>" in s for s in source_txt)
+            if not contains_chat_tokens:
+                # 构建对话格式，并保留原始翻译指令（避免丢失翻译目标）
+                def _strip_chat_tokens(text: str) -> str:
+                    # 去除 <|im_start|> 和 <|im_end|> 相关标记，保留纯文本指令
+                    return (
+                        text.replace("<|im_start|>system", "")
+                            .replace("<|im_start|>user", "")
+                            .replace("<|im_start|>assistant", "")
+                            .replace("<|im_end|>", "")
+                            .strip()
+                    )
 
-            # 使用新文本覆盖
-            source_txt = new_source_txt
+                system_prompt = _strip_chat_tokens(params.Instruct) or "You are a helpful assistant."
+
+                new_source_txt = []
+                for s in source_txt:
+                    messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": s}
+                    ]
+                    text = tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True  # 添加 assistant 起始提示
+                    )
+                    new_source_txt.append(text)
+
+                # 使用新文本覆盖
+                source_txt = new_source_txt
 
             # 重新tokenize
             inputs = tokenizer(
@@ -1256,15 +1326,30 @@ def main():
         stats['inference_times'].append(inference_time)
 
         # 解码输出
-        output_text = tokenizer.decode(output_sequences[0], skip_special_tokens=True)
+        # 有些生成函数返回“仅生成部分”，有些返回“提示+生成”。做兼容处理：
+        # 如果生成序列长度不大于输入长度，则认为返回的就是纯生成；否则截掉前 input_length。
+        input_length = input_ids.shape[1]
+        if len(output_sequences[0]) > input_length:
+            generated_tokens = output_sequences[0][input_length:]
+        else:
+            generated_tokens = output_sequences[0]
+        output_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        
         target_txt_lt.extend(target_txt)
         output_text_lt.extend([output_text])
 
-        # 添加调试信息
+        # 添加调试信息（文件 + 控制台）
         if step == 0 or step < 3:  # 只打印前几个样本的详细信息
             logging.info(f"[DEBUG] Sample {step} output:")
             logging.info(f"  Output length: {len(output_sequences[0])} tokens")
             logging.info(f"  Output text (first 500 chars): {output_text[:500]}...")
+            logging.info(f"  Target text (first 500 chars): {target_txt[0][:500] if target_txt else ''}...")
+
+            print(f"\n[DEBUG] Sample {step} output:")
+            print(f"  Output length: {len(output_sequences[0])} tokens")
+            print(f"  Output text (first 300 chars): {output_text[:300]}...")
+            if target_txt:
+                print(f"  Target text (first 300 chars): {target_txt[0][:300]}")
 
         # 记录统计信息
         seq_len = len(output_sequences[0])
@@ -1353,12 +1438,22 @@ def main():
             output_text_lt = output_text_lt[:min_len]
             target_txt_lt = target_txt_lt[:min_len]
 
+            # 记录前几个样本用于调试
+            logging.info(f"\n=== BLEU Calculation Debug ===")
+            logging.info(f"Number of samples: {len(output_text_lt)}")
+            for i in range(min(3, len(output_text_lt))):
+                logging.info(f"\nSample {i}:")
+                logging.info(f"  Target: {target_txt_lt[i][:200] if len(target_txt_lt[i]) > 200 else target_txt_lt[i]}")
+                logging.info(f"  Output: {output_text_lt[i][:200] if len(output_text_lt[i]) > 200 else output_text_lt[i]}")
+            
             try:
                 bleu = sacrebleu.corpus_bleu(output_text_lt, [target_txt_lt])
                 bleu_score = bleu.score
                 logging.info(f"BLEU score: {bleu_score:.2f}")
             except Exception as e:
                 logging.error(f"Failed to calculate BLEU: {e}")
+                logging.error(f"Output texts count: {len(output_text_lt)}")
+                logging.error(f"Target texts count: {len(target_txt_lt)}")
                 bleu_score = 0.0
 
     # 内存统计

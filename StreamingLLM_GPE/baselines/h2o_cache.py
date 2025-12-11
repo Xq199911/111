@@ -91,6 +91,36 @@ class H2OCache(Cache):
         
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
+    def _sliding_window_fallback(
+            self,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            remaining_budget: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        回退到 Sliding Window 策略（保留 Sink + 最近的 Window）
+        
+        Args:
+            key: [batch, num_heads, seq_len, head_dim]
+            value: [batch, num_heads, seq_len, head_dim]
+            remaining_budget: 除了sink之外还能保留的token数量
+            
+        Returns:
+            compressed_key, compressed_value
+        """
+        sink_key = key[:, :, :self.sink_tokens]
+        sink_value = value[:, :, :self.sink_tokens]
+        
+        # 取最近的 remaining_budget 个 tokens
+        window_key = key[:, :, -remaining_budget:]
+        window_value = value[:, :, -remaining_budget:]
+        
+        # 拼接
+        compressed_key = torch.cat([sink_key, window_key], dim=2)
+        compressed_value = torch.cat([sink_value, window_value], dim=2)
+        
+        return compressed_key, compressed_value
+
     def _compress(
             self,
             key: torch.Tensor,
@@ -104,7 +134,7 @@ class H2OCache(Cache):
         Args:
             key: [batch, num_heads, seq_len, head_dim]
             value: [batch, num_heads, seq_len, head_dim]
-            attention_scores: [batch, num_heads, seq_len, seq_len] 或 None
+            attention_scores: [batch, num_heads, seq_len, seq_len] 或 [batch, num_heads, 1, seq_len] 或 None
         """
         batch_size, num_heads, seq_len, head_dim = key.shape
 
@@ -120,19 +150,7 @@ class H2OCache(Cache):
                     f"[H2O Warning] Layer {layer_idx}: No attention scores found! Falling back to Sliding Window (StreamingLLM).")
                 self._has_warned_no_attn = True
 
-            # 策略：保留 Sink + 最近的 Window
-            sink_key = key[:, :, :self.sink_tokens]
-            sink_value = value[:, :, :self.sink_tokens]
-
-            # 取最近的 remaining_budget 个 tokens
-            window_key = key[:, :, -remaining_budget:]
-            window_value = value[:, :, -remaining_budget:]
-
-            # 拼接
-            compressed_key = torch.cat([sink_key, window_key], dim=2)
-            compressed_value = torch.cat([sink_value, window_value], dim=2)
-
-            return compressed_key, compressed_value
+            return self._sliding_window_fallback(key, value, remaining_budget)
 
         # 2. 如果有 attention_scores，执行正常的 H2O 逻辑
         # 保留sink tokens
@@ -140,16 +158,32 @@ class H2OCache(Cache):
         sink_value = value[:, :, :self.sink_tokens]
 
         # 使用attention scores作为重要性
-        # importance shape: [batch, num_heads, seq_len, seq_len] (通常)
-        # 注意：这里假设 attention_scores 包含了历史所有 token 的注意力
-        # 如果是 generation 阶段，attention_scores 可能只包含当前 token 对过去的注意力
-        # H2O 实际上需要累积注意力分数 (Accumulated Attention Scores)
-
-        # 计算每个token的重要性：对query维度求和
-        importance = attention_scores.sum(dim=-2)  # [batch, num_heads, seq_len] (兼容性更好的写法 dim=-2)
+        # attention_scores 可能的形状：
+        # - [batch, num_heads, seq_len, seq_len] (预填充阶段，所有token对token的注意力)
+        # - [batch, num_heads, 1, seq_len] (生成阶段，当前token对历史tokens的注意力)
+        # H2O 需要累积注意力分数，但在生成阶段我们只能使用当前token的注意力
+        
+        # 处理不同形状的 attention_scores
+        if attention_scores.dim() == 4:
+            if attention_scores.size(2) == 1:
+                # 生成阶段: [batch, num_heads, 1, seq_len] -> [batch, num_heads, seq_len]
+                importance = attention_scores.squeeze(2)  # [batch, num_heads, seq_len]
+            else:
+                # 预填充阶段: [batch, num_heads, seq_len, seq_len] -> [batch, num_heads, seq_len]
+                # 对query维度求和，得到每个key token被关注的总次数
+                importance = attention_scores.sum(dim=-2)  # [batch, num_heads, seq_len]
+        else:
+            # 如果形状不符合预期，回退到 sliding window
+            print(f"[H2O Warning] Layer {layer_idx}: Unexpected attention_scores shape {attention_scores.shape}. Falling back to Sliding Window.")
+            return self._sliding_window_fallback(key, value, remaining_budget)
 
         # 对所有heads求平均 (H2O 论文中通常是对每个 Head 独立做，但这里统一处理也可以)
         importance = importance.mean(dim=1)  # [batch, seq_len]
+
+        # 确保 importance 的长度与 key 的序列长度匹配
+        if importance.size(1) != seq_len:
+            print(f"[H2O Warning] Layer {layer_idx}: Importance length {importance.size(1)} != key seq_len {seq_len}. Falling back to Sliding Window.")
+            return self._sliding_window_fallback(key, value, remaining_budget)
 
         # 排除sink tokens (因为sink会被强制保留，不参与竞争)
         importance_no_sink = importance[:, self.sink_tokens:]
@@ -164,12 +198,13 @@ class H2OCache(Cache):
         # 调整索引（加上sink tokens的偏移，恢复到原始 key 的索引）
         top_indices = top_indices + self.sink_tokens  # [batch, k]
 
-        # 排序索引，保持时序 (可选，但在 KV Cache 中通常保持时序更好)
+        # 排序索引，保持时序 (保持时序对于 KV Cache 很重要)
         top_indices, _ = top_indices.sort(dim=1)
 
         # 收集选中的tokens
         # 扩展索引维度以匹配 gather 的要求: [batch, num_heads, k, head_dim]
-        gather_index = top_indices.unsqueeze(1).unsqueeze(-1).expand(-1, num_heads, -1, head_dim)
+        # 确保索引是 long 类型
+        gather_index = top_indices.unsqueeze(1).unsqueeze(-1).expand(-1, num_heads, -1, head_dim).long()
 
         selected_key = torch.gather(key, dim=2, index=gather_index)
         selected_value = torch.gather(value, dim=2, index=gather_index)
