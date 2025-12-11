@@ -8,5 +8,5 @@
     "assistant_Instruct":"<|im_start|>assistant\n",
     "end_Instruct":"<|im_end|>\n",
 
-    "file_path": "./StreamingLLM_GPE/data/inference_data.json"
+    "file_path": "./StreamingLLM_GPE/data/long_inference_data.json"
 }

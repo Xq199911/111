@@ -6,10 +6,16 @@
 # import os
 # import sys
 #
+# # ================= [关键修复] =================
+# # 强制屏蔽 TensorFlow，防止 broken environment 导致的 numpy 冲突崩溃
+# # 这行代码必须放在所有 import 之前
+# sys.modules['tensorflow'] = None
+# os.environ["USE_TF"] = "0"
+# os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+# # ============================================
+#
 # # 禁用HuggingFace数据集缓存，确保使用最新的数据文件
 # os.environ["HF_DATASETS_DISABLE_CACHE"] = "1"
-# # 禁用tensorflow以避免numpy兼容性问题
-# os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 # os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # # 禁用tensorflow导入（如果不需要）
 # os.environ["NO_TF"] = "1"
@@ -39,13 +45,13 @@
 # from StreamingLLM_GPE.utils.group_tracker import GroupTracker
 # from StreamingLLM_GPE.utils.budget_monitor import BudgetMonitor
 # import importlib.util
+#
 # _utils_file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'utils.py')
 # _spec = importlib.util.spec_from_file_location("StreamingLLM_GPE.utils_module", _utils_file_path)
 # utils = importlib.util.module_from_spec(_spec)
 # _spec.loader.exec_module(utils)
 # from StreamingLLM_GPE.evaluate.lagging import calculate_al_and_laal
 # import sacrebleu
-#
 #
 # # 模型类映射
 # MODEL_CLASSES = {
@@ -57,6 +63,7 @@
 #
 # class MemoryMonitor:
 #     """监控GPU内存使用"""
+#
 #     def __init__(self, device=0):
 #         self.device = device
 #         self.peak_memory = 0
@@ -65,16 +72,13 @@
 #     def record(self):
 #         if torch.cuda.is_available():
 #             torch.cuda.synchronize()
-#             # 使用 max_memory_allocated 获取峰值，而非当前占用
-#             # 这样才能捕捉到 KV Cache 尚未被 Python GC 回收时的真实物理显存占用
-#             current_peak = torch.cuda.max_memory_allocated(self.device) / (1024**3)  # GB
-#             current_alloc = torch.cuda.memory_allocated(self.device) / (1024**3)
+#             # 使用 max_memory_allocated 获取峰值
+#             current_peak = torch.cuda.max_memory_allocated(self.device) / (1024 ** 3)  # GB
+#             current_alloc = torch.cuda.memory_allocated(self.device) / (1024 ** 3)
 #
 #             self.memory_history.append(current_alloc)
 #             self.peak_memory = max(self.peak_memory, current_peak)
 #
-#             # 建议：如果需要精细分析，可以在每步之后重置峰值统计，这里暂时注释掉以免影响全局统计
-#             # torch.cuda.reset_peak_memory_stats(self.device)
 #             return current_alloc
 #         return 0
 #
@@ -118,9 +122,7 @@
 #     # Multi-model evaluation arguments
 #     parser.add_argument("--max_samples", type=int, default=None, help="Maximum number of samples to process")
 #
-#     # 将默认值从 0 改为 3000。
-#     # KV Cache 压缩只有在序列长度 > 预算 (如 2048) 时才生效。
-#     # 如果测短序列 (如 256)，所有方法都会全量缓存，导致显存无减少，实验无效。
+#     # 强制测试长序列 (默认3000)
 #     parser.add_argument("--min_source_length", type=int, default=3000, help="Minimum source length in words")
 #
 #     parser.add_argument("--max_new_tokens", type=int, default=1024, help="Maximum number of new tokens to generate")
@@ -259,6 +261,16 @@
 #     )
 #
 #     # 记录配置
+#     # 确定显示的预算值
+#     if args.use_h2o:
+#         budget_display = f"{args.h2o_budget} tokens/layer (H2O)"
+#     elif args.use_streamingllm:
+#         budget_display = f"{args.streamingllm_window} tokens (StreamingLLM window)"
+#     elif args.use_head_aware:
+#         budget_display = f"{args.total_budget} tokens/layer (Head-Aware)"
+#     else:
+#         budget_display = f"{args.total_budget} tokens/layer (default)"
+#
 #     config_str = f"""
 #     Multi-Model Evaluation Configuration:
 #     - Model Architecture: {args.LLM_backbone}
@@ -266,11 +278,14 @@
 #     - Inference Mode: {args.inference_mode}
 #     - Head-Aware: {args.use_head_aware}
 #     - Group-Aware: {args.use_group_aware}
-#     - Total Budget: {args.total_budget} tokens/layer
+#     - H2O: {args.use_h2o}
+#     - StreamingLLM: {args.use_streamingllm}
+#     - Cache Budget: {budget_display}
 #     - Max Memory: {args.max_memory_gb} GB
 #     - Wait-k: {args.wait_k}
 #     - Min Source Length: {args.min_source_length}
 #     - Max Samples: {args.max_samples}
+#     - Max New Tokens: {args.max_new_tokens}
 #     """
 #     print(config_str)
 #     logging.info(config_str)
@@ -361,14 +376,56 @@
 #
 #     data_collator_dataset = data_collator.dataset_loader()
 #
+#     # 记录初始数据集大小
+#     initial_size = len(data_collator_dataset)
+#     logging.info(f"Loaded dataset with {initial_size} samples from {params.file_path}")
+#
+#     if initial_size == 0:
+#         logging.error(f"No samples found in data file: {params.file_path}")
+#         raise ValueError(f"No samples available in data file: {params.file_path}. Please check the file path and format.")
+#
 #     # 过滤短序列（如果指定了最小长度）
 #     if args.min_source_length > 0:
 #         def filter_long_sequences(example):
-#             source_words = example.get("source_txt", "").split()
+#             source_txt = example.get("source_txt", "")
+#             if not source_txt:
+#                 return False
+#             source_words = source_txt.split()
 #             return len(source_words) >= args.min_source_length
 #
+#         before_filter_size = len(data_collator_dataset)
 #         data_collator_dataset = data_collator_dataset.filter(filter_long_sequences)
-#         logging.info(f"Filtered dataset: keeping sequences with >= {args.min_source_length} source words")
+#         after_filter_size = len(data_collator_dataset)
+#         logging.info(f"Filtered dataset: {before_filter_size} -> {after_filter_size} samples (keeping sequences with >= {args.min_source_length} source words)")
+#
+#         if after_filter_size == 0:
+#             # 提供更详细的诊断信息
+#             logging.warning(f"All samples were filtered out! Checking sample lengths...")
+#             # 检查前几个样本的长度
+#             sample_lengths = []
+#             for i, example in enumerate(data_collator.dataset_loader()):
+#                 if i >= 5:  # 只检查前5个样本
+#                     break
+#                 source_txt = example.get("source_txt", "")
+#                 if source_txt:
+#                     word_count = len(source_txt.split())
+#                     sample_lengths.append(word_count)
+#
+#             if sample_lengths:
+#                 max_length = max(sample_lengths)
+#                 avg_length = sum(sample_lengths) / len(sample_lengths)
+#                 logging.error(f"Sample word counts (first {len(sample_lengths)}): {sample_lengths}")
+#                 logging.error(f"Max length: {max_length}, Average length: {avg_length:.1f}")
+#                 logging.error(f"Required minimum: {args.min_source_length}")
+#                 logging.error(f"Try reducing --min_source_length (e.g., --min_source_length {max(100, int(avg_length))})")
+#             else:
+#                 logging.error("Could not read sample lengths. Check data file format.")
+#
+#             raise ValueError(
+#                 f"No samples available after filtering with min_source_length={args.min_source_length}. "
+#                 f"Original dataset size: {before_filter_size}. "
+#                 f"Try reducing --min_source_length or check your data file."
+#             )
 #
 #     # 限制样本数量（用于测试）
 #     original_size = len(data_collator_dataset)
@@ -450,26 +507,41 @@
 #         source_txt = batch.get("source_txt", None)
 #         target_txt = batch.get("target_txt", None)
 #
-#         # 🚨 修正（第二个问题）：如果是Instruct模型，应用Chat Template并重新Tokenize
+#         # 应用Chat Template并重新Tokenize
 #         if "Instruct" in args.LLM_path or "Chat" in args.LLM_path:
-#             # 构建对话格式
-#             new_source_txt = []
-#             for s in source_txt:
-#                 messages = [
-#                     {"role": "system", "content": "You are a helpful assistant."},
-#                     {"role": "user", "content": s}
-#                 ]
-#                 text = tokenizer.apply_chat_template(
-#                     messages,
-#                     tokenize=False,
-#                     add_generation_prompt=True
-#                 )
-#                 new_source_txt.append(text)
+#             # 如果原始文本已经包含 <|im_start|> / <|im_end|> 等标记，则视为已构造好对话格式，直接使用
+#             contains_chat_tokens = any("<|im_start|>" in s or "<|im_end|>" in s for s in source_txt)
+#             if not contains_chat_tokens:
+#                 # 构建对话格式，并保留原始翻译指令（避免丢失翻译目标）
+#                 def _strip_chat_tokens(text: str) -> str:
+#                     # 去除 <|im_start|> 和 <|im_end|> 相关标记，保留纯文本指令
+#                     return (
+#                         text.replace("<|im_start|>system", "")
+#                             .replace("<|im_start|>user", "")
+#                             .replace("<|im_start|>assistant", "")
+#                             .replace("<|im_end|>", "")
+#                             .strip()
+#                     )
 #
-#             # 使用新文本覆盖
-#             source_txt = new_source_txt
+#                 system_prompt = _strip_chat_tokens(params.Instruct) or "You are a helpful assistant."
 #
-#             # 重新tokenize (因为输入文本变了)
+#                 new_source_txt = []
+#                 for s in source_txt:
+#                     messages = [
+#                         {"role": "system", "content": system_prompt},
+#                         {"role": "user", "content": s}
+#                     ]
+#                     text = tokenizer.apply_chat_template(
+#                         messages,
+#                         tokenize=False,
+#                         add_generation_prompt=True  # 添加 assistant 起始提示
+#                     )
+#                     new_source_txt.append(text)
+#
+#                 # 使用新文本覆盖
+#                 source_txt = new_source_txt
+#
+#             # 重新tokenize
 #             inputs = tokenizer(
 #                 source_txt,
 #                 return_tensors="pt",
@@ -480,7 +552,7 @@
 #             input_ids = inputs.input_ids
 #             attention_mask = inputs.attention_mask
 #
-#             # 更新 batch 中的长度信息 (用于streaming generation)
+#             # 更新 batch 中的长度信息
 #             batch["source_tokens"] = input_ids
 #             batch["attention_mask"] = attention_mask
 #         else:
@@ -505,7 +577,8 @@
 #             source_word_count = len(source_words)
 #
 #             logging.info(f"[DEBUG] Sample {step}:")
-#             logging.info(f"  Source text (first 200 chars): {source_text_full[:200] if source_text_full != 'N/A' else 'N/A'}...")
+#             logging.info(
+#                 f"  Source text (first 200 chars): {source_text_full[:200] if source_text_full != 'N/A' else 'N/A'}...")
 #             logging.info(f"  Source length: {source_word_count} words")
 #
 #             logging.info(f"  Input IDs shape: {input_ids.shape}")
@@ -547,15 +620,30 @@
 #         stats['inference_times'].append(inference_time)
 #
 #         # 解码输出
-#         output_text = tokenizer.decode(output_sequences[0], skip_special_tokens=True)
+#         # 有些生成函数返回“仅生成部分”，有些返回“提示+生成”。做兼容处理：
+#         # 如果生成序列长度不大于输入长度，则认为返回的就是纯生成；否则截掉前 input_length。
+#         input_length = input_ids.shape[1]
+#         if len(output_sequences[0]) > input_length:
+#             generated_tokens = output_sequences[0][input_length:]
+#         else:
+#             generated_tokens = output_sequences[0]
+#         output_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+#
 #         target_txt_lt.extend(target_txt)
 #         output_text_lt.extend([output_text])
 #
-#         # 添加调试信息
+#         # 添加调试信息（文件 + 控制台）
 #         if step == 0 or step < 3:  # 只打印前几个样本的详细信息
 #             logging.info(f"[DEBUG] Sample {step} output:")
 #             logging.info(f"  Output length: {len(output_sequences[0])} tokens")
 #             logging.info(f"  Output text (first 500 chars): {output_text[:500]}...")
+#             logging.info(f"  Target text (first 500 chars): {target_txt[0][:500] if target_txt else ''}...")
+#
+#             print(f"\n[DEBUG] Sample {step} output:")
+#             print(f"  Output length: {len(output_sequences[0])} tokens")
+#             print(f"  Output text (first 300 chars): {output_text[:300]}...")
+#             if target_txt:
+#                 print(f"  Target text (first 300 chars): {target_txt[0][:300]}")
 #
 #         # 记录统计信息
 #         seq_len = len(output_sequences[0])
@@ -625,7 +713,8 @@
 #             print(f"\n[{args.LLM_backbone}] Step {step}:")
 #             print(f"  Output Length: {seq_len} tokens")
 #             if args.use_head_aware:
-#                 print(f"  Cache Memory: {stats['cache_memory_gb'][-1]:.2f}GB" if stats['cache_memory_gb'] else "  Cache Memory: 0.00GB")
+#                 print(f"  Cache Memory: {stats['cache_memory_gb'][-1]:.2f}GB" if stats[
+#                     'cache_memory_gb'] else "  Cache Memory: 0.00GB")
 #
 #     # 计算最终指标
 #     if len(output_text_lt) == 0:
@@ -643,12 +732,22 @@
 #             output_text_lt = output_text_lt[:min_len]
 #             target_txt_lt = target_txt_lt[:min_len]
 #
+#             # 记录前几个样本用于调试
+#             logging.info(f"\n=== BLEU Calculation Debug ===")
+#             logging.info(f"Number of samples: {len(output_text_lt)}")
+#             for i in range(min(3, len(output_text_lt))):
+#                 logging.info(f"\nSample {i}:")
+#                 logging.info(f"  Target: {target_txt_lt[i][:200] if len(target_txt_lt[i]) > 200 else target_txt_lt[i]}")
+#                 logging.info(f"  Output: {output_text_lt[i][:200] if len(output_text_lt[i]) > 200 else output_text_lt[i]}")
+#
 #             try:
 #                 bleu = sacrebleu.corpus_bleu(output_text_lt, [target_txt_lt])
 #                 bleu_score = bleu.score
 #                 logging.info(f"BLEU score: {bleu_score:.2f}")
 #             except Exception as e:
 #                 logging.error(f"Failed to calculate BLEU: {e}")
+#                 logging.error(f"Output texts count: {len(output_text_lt)}")
+#                 logging.error(f"Target texts count: {len(target_txt_lt)}")
 #                 bleu_score = 0.0
 #
 #     # 内存统计
@@ -658,7 +757,7 @@
 #
 #     if args.use_head_aware:
 #         if stats['cache_memory_gb']:
-#             avg_cache = sum(stats['cache_memory_gb'])/len(stats['cache_memory_gb'])
+#             avg_cache = sum(stats['cache_memory_gb']) / len(stats['cache_memory_gb'])
 #             peak_cache = max(stats['cache_memory_gb'])
 #             logging.info(f"Average Cache Memory: {avg_cache:.4f}GB")
 #             logging.info(f"Peak Cache Memory: {peak_cache:.4f}GB")
@@ -676,7 +775,8 @@
 #         'bleu_score': bleu_score,
 #         'memory_stats': memory_stats,
 #         'cache_stats': {
-#             'avg_cache_memory_gb': sum(stats['cache_memory_gb'])/len(stats['cache_memory_gb']) if stats['cache_memory_gb'] else 0,
+#             'avg_cache_memory_gb': sum(stats['cache_memory_gb']) / len(stats['cache_memory_gb']) if stats[
+#                 'cache_memory_gb'] else 0,
 #             'peak_cache_memory_gb': max(stats['cache_memory_gb']) if stats['cache_memory_gb'] else 0,
 #         },
 #         'length_stats': {
@@ -685,7 +785,8 @@
 #             'avg_length': stats['total_tokens'] / len(output_text_lt) if output_text_lt else 0,
 #         },
 #         'latency_stats': {
-#             'avg_inference_time': sum(stats['inference_times']) / len(stats['inference_times']) if stats['inference_times'] else 0,
+#             'avg_inference_time': sum(stats['inference_times']) / len(stats['inference_times']) if stats[
+#                 'inference_times'] else 0,
 #         },
 #         'streaming_stats': {
 #             'avg_AL': avg_AL if inference_mode == "streaming" else 0,
@@ -704,6 +805,7 @@
 #
 # if __name__ == "__main__":
 #     main()
+
 """
 多模型评估脚本
 支持: Qwen, Llama, Gemma, Phi3
@@ -714,7 +816,6 @@ import sys
 
 # ================= [关键修复] =================
 # 强制屏蔽 TensorFlow，防止 broken environment 导致的 numpy 冲突崩溃
-# 这行代码必须放在所有 import 之前
 sys.modules['tensorflow'] = None
 os.environ["USE_TF"] = "0"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -976,7 +1077,7 @@ def main():
         budget_display = f"{args.total_budget} tokens/layer (Head-Aware)"
     else:
         budget_display = f"{args.total_budget} tokens/layer (default)"
-    
+
     config_str = f"""
     Multi-Model Evaluation Configuration:
     - Model Architecture: {args.LLM_backbone}
@@ -1081,14 +1182,15 @@ def main():
     )
 
     data_collator_dataset = data_collator.dataset_loader()
-    
+
     # 记录初始数据集大小
     initial_size = len(data_collator_dataset)
     logging.info(f"Loaded dataset with {initial_size} samples from {params.file_path}")
-    
+
     if initial_size == 0:
         logging.error(f"No samples found in data file: {params.file_path}")
-        raise ValueError(f"No samples available in data file: {params.file_path}. Please check the file path and format.")
+        raise ValueError(
+            f"No samples available in data file: {params.file_path}. Please check the file path and format.")
 
     # 过滤短序列（如果指定了最小长度）
     if args.min_source_length > 0:
@@ -1102,8 +1204,9 @@ def main():
         before_filter_size = len(data_collator_dataset)
         data_collator_dataset = data_collator_dataset.filter(filter_long_sequences)
         after_filter_size = len(data_collator_dataset)
-        logging.info(f"Filtered dataset: {before_filter_size} -> {after_filter_size} samples (keeping sequences with >= {args.min_source_length} source words)")
-        
+        logging.info(
+            f"Filtered dataset: {before_filter_size} -> {after_filter_size} samples (keeping sequences with >= {args.min_source_length} source words)")
+
         if after_filter_size == 0:
             # 提供更详细的诊断信息
             logging.warning(f"All samples were filtered out! Checking sample lengths...")
@@ -1116,17 +1219,18 @@ def main():
                 if source_txt:
                     word_count = len(source_txt.split())
                     sample_lengths.append(word_count)
-            
+
             if sample_lengths:
                 max_length = max(sample_lengths)
                 avg_length = sum(sample_lengths) / len(sample_lengths)
                 logging.error(f"Sample word counts (first {len(sample_lengths)}): {sample_lengths}")
                 logging.error(f"Max length: {max_length}, Average length: {avg_length:.1f}")
                 logging.error(f"Required minimum: {args.min_source_length}")
-                logging.error(f"Try reducing --min_source_length (e.g., --min_source_length {max(100, int(avg_length))})")
+                logging.error(
+                    f"Try reducing --min_source_length (e.g., --min_source_length {max(100, int(avg_length))})")
             else:
                 logging.error("Could not read sample lengths. Check data file format.")
-            
+
             raise ValueError(
                 f"No samples available after filtering with min_source_length={args.min_source_length}. "
                 f"Original dataset size: {before_filter_size}. "
@@ -1215,37 +1319,22 @@ def main():
 
         # 应用Chat Template并重新Tokenize
         if "Instruct" in args.LLM_path or "Chat" in args.LLM_path:
-            # 如果原始文本已经包含 <|im_start|> / <|im_end|> 等标记，则视为已构造好对话格式，直接使用
-            contains_chat_tokens = any("<|im_start|>" in s or "<|im_end|>" in s for s in source_txt)
-            if not contains_chat_tokens:
-                # 构建对话格式，并保留原始翻译指令（避免丢失翻译目标）
-                def _strip_chat_tokens(text: str) -> str:
-                    # 去除 <|im_start|> 和 <|im_end|> 相关标记，保留纯文本指令
-                    return (
-                        text.replace("<|im_start|>system", "")
-                            .replace("<|im_start|>user", "")
-                            .replace("<|im_start|>assistant", "")
-                            .replace("<|im_end|>", "")
-                            .strip()
-                    )
+            # 构建对话格式
+            new_source_txt = []
+            for s in source_txt:
+                messages = [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": s}
+                ]
+                text = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+                new_source_txt.append(text)
 
-                system_prompt = _strip_chat_tokens(params.Instruct) or "You are a helpful assistant."
-
-                new_source_txt = []
-                for s in source_txt:
-                    messages = [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": s}
-                    ]
-                    text = tokenizer.apply_chat_template(
-                        messages,
-                        tokenize=False,
-                        add_generation_prompt=True  # 添加 assistant 起始提示
-                    )
-                    new_source_txt.append(text)
-
-                # 使用新文本覆盖
-                source_txt = new_source_txt
+            # 使用新文本覆盖
+            source_txt = new_source_txt
 
             # 重新tokenize
             inputs = tokenizer(
@@ -1326,33 +1415,37 @@ def main():
         stats['inference_times'].append(inference_time)
 
         # 解码输出
-        # 有些生成函数返回“仅生成部分”，有些返回“提示+生成”。做兼容处理：
-        # 如果生成序列长度不大于输入长度，则认为返回的就是纯生成；否则截掉前 input_length。
-        input_length = input_ids.shape[1]
-        if len(output_sequences[0]) > input_length:
-            generated_tokens = output_sequences[0][input_length:]
+        # [FIX] 核心修复：Batch模式下需要切除输入Prompt，Streaming模式通常不需要（但已做兼容）
+        if inference_mode == "batch":
+            # Batch generate 返回 [Prompt + Response]
+            # 获取Prompt长度
+            input_token_len = input_ids.shape[1]
+            # 截取 Response 部分
+            generated_tokens = output_sequences[0][input_token_len:]
         else:
+            # Streaming generate 通常只返回生成的 Token
             generated_tokens = output_sequences[0]
+
         output_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-        
+
         target_txt_lt.extend(target_txt)
         output_text_lt.extend([output_text])
 
         # 添加调试信息（文件 + 控制台）
         if step == 0 or step < 3:  # 只打印前几个样本的详细信息
             logging.info(f"[DEBUG] Sample {step} output:")
-            logging.info(f"  Output length: {len(output_sequences[0])} tokens")
+            logging.info(f"  Output length: {len(generated_tokens)} tokens")
             logging.info(f"  Output text (first 500 chars): {output_text[:500]}...")
             logging.info(f"  Target text (first 500 chars): {target_txt[0][:500] if target_txt else ''}...")
 
             print(f"\n[DEBUG] Sample {step} output:")
-            print(f"  Output length: {len(output_sequences[0])} tokens")
+            print(f"  Output length: {len(generated_tokens)} tokens")
             print(f"  Output text (first 300 chars): {output_text[:300]}...")
             if target_txt:
                 print(f"  Target text (first 300 chars): {target_txt[0][:300]}")
 
         # 记录统计信息
-        seq_len = len(output_sequences[0])
+        seq_len = len(generated_tokens)
         stats['total_tokens'] += seq_len
         stats['max_length'] = max(stats['max_length'], seq_len)
 
@@ -1444,8 +1537,9 @@ def main():
             for i in range(min(3, len(output_text_lt))):
                 logging.info(f"\nSample {i}:")
                 logging.info(f"  Target: {target_txt_lt[i][:200] if len(target_txt_lt[i]) > 200 else target_txt_lt[i]}")
-                logging.info(f"  Output: {output_text_lt[i][:200] if len(output_text_lt[i]) > 200 else output_text_lt[i]}")
-            
+                logging.info(
+                    f"  Output: {output_text_lt[i][:200] if len(output_text_lt[i]) > 200 else output_text_lt[i]}")
+
             try:
                 bleu = sacrebleu.corpus_bleu(output_text_lt, [target_txt_lt])
                 bleu_score = bleu.score

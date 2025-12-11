@@ -803,56 +803,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 
 
 # -----------------------------------------------------------------------------
-# Custom Cache Classes (Preserved from original file)
-# -----------------------------------------------------------------------------
-class QueryCache(Cache):
-    def __init__(self) -> None:
-        super().__init__()
-        self.query_cache: List[torch.Tensor] = []
-        self._seen_tokens = 0
-
-    def update(
-            self,
-            query_states: torch.Tensor,
-            layer_idx: int,
-    ):
-        # Update the number of seen tokens
-        if layer_idx == 0:
-            self._seen_tokens += query_states.shape[-2]
-
-        # Update the cache
-        if len(self.query_cache) <= layer_idx:
-            self.query_cache.append(query_states)
-        else:
-            self.query_cache[layer_idx] = torch.cat([self.query_cache[layer_idx], query_states], dim=-2)
-
-        return self.query_cache[layer_idx]
-
-    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
-        """Returns the sequence length of the cached states. A layer index can be optionally passed."""
-        if len(self.query_cache) <= layer_idx:
-            return 0
-        return self.query_cache[layer_idx].shape[-2]
-
-
-class DynamicCache(TransformersDynamicCache):
-    def __init__(self) -> None:
-        super().__init__()
-
-    def pop(self):
-        self._seen_tokens -= 1
-
-        # Update the cache
-        target_key_cache = []
-        target_value_cache = []
-        for key_cache, value_cache in zip(self.key_cache, self.value_cache):
-            target_key_cache.append(key_cache[..., :-1, :])
-            target_value_cache.append(value_cache[..., :-1, :])
-        self.key_cache = target_key_cache
-        self.value_cache = target_value_cache
-
-
-# -----------------------------------------------------------------------------
 # Output Data Classes
 # -----------------------------------------------------------------------------
 @dataclass
@@ -1041,6 +991,7 @@ class Qwen2Attention_stream(Qwen2Attention):
                 if ReadAction:
                     # Reading Source
                     cache_kwargs_source = {"sin": sin, "cos": cos, "cache_position": None}
+                    # Update Source Cache. source_key_values should not be None here.
                     key_states, value_states = source_key_values.update(
                         key_states, value_states, self.layer_idx, cache_kwargs_source
                     )
@@ -1048,6 +999,7 @@ class Qwen2Attention_stream(Qwen2Attention):
                 elif not ReadAction:
                     # Generating Target
                     cache_kwargs_target = {"sin": sin, "cos": cos, "cache_position": None}
+                    # Update Target Cache
                     target_key, target_value = past_key_value.update(
                         key_states, value_states, self.layer_idx, cache_kwargs_target
                     )
