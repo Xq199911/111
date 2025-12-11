@@ -6,9 +6,6 @@
 import os
 import sys
 
-# ================= [关键修复] =================
-# 强制屏蔽 TensorFlow，防止 broken environment 导致的 numpy 冲突崩溃
-sys.modules['tensorflow'] = None
 os.environ["USE_TF"] = "0"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 # ============================================
@@ -16,7 +13,6 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 # 禁用HuggingFace数据集缓存，确保使用最新的数据文件
 os.environ["HF_DATASETS_DISABLE_CACHE"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-# 禁用tensorflow导入（如果不需要）
 os.environ["NO_TF"] = "1"
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
@@ -164,13 +160,17 @@ def create_cache(head_analyzer, group_tracker, args, model_name='Qwen'):
     """创建KV cache"""
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
 
-    # Baseline methods
+    # ================= [关键修复 1] 增加 Sink Tokens =================
+    # 将 sink_tokens 从 4 增加到 128
+    # 这是为了防止在处理长文本时，H2O 为了节省空间把开头的 System Prompt（翻译指令）删掉
+    # 删掉指令后，模型就会忘记自己是在做翻译，变成做阅读理解
+
     if args.use_h2o:
         try:
             from StreamingLLM_GPE.baselines.h2o_cache import H2OCache
             return H2OCache(
                 budget_per_layer=args.h2o_budget,
-                sink_tokens=128,
+                sink_tokens=128,  # [FIXED] 4 -> 128
                 device=device
             )
         except ImportError:
@@ -186,6 +186,7 @@ def create_cache(head_analyzer, group_tracker, args, model_name='Qwen'):
             )
         except ImportError:
             raise ImportError("StreamingLLM baseline not implemented. See BASELINE_IMPLEMENTATION_GUIDE.md")
+    # ================================================================
 
     if args.use_head_aware:
         # 根据模型类型选择对应的HeadAwareCache
@@ -203,7 +204,7 @@ def create_cache(head_analyzer, group_tracker, args, model_name='Qwen'):
                 head_analyzer=head_analyzer,
                 group_tracker=group_tracker,
                 total_budget=args.total_budget,
-                sink_tokens=4,
+                sink_tokens=128,
                 adaptive=True,
                 device=device
             )
@@ -212,7 +213,7 @@ def create_cache(head_analyzer, group_tracker, args, model_name='Qwen'):
                 head_analyzer=head_analyzer,
                 group_tracker=group_tracker,
                 total_budget=args.total_budget,
-                sink_tokens=4,
+                sink_tokens=128,
                 adaptive=True,
                 device=device
             )
@@ -222,7 +223,7 @@ def create_cache(head_analyzer, group_tracker, args, model_name='Qwen'):
                 head_analyzer=head_analyzer,
                 group_tracker=group_tracker,
                 total_budget=args.total_budget,
-                sink_tokens=4,
+                sink_tokens=128,
                 adaptive=True,
                 device=device
             )
@@ -453,7 +454,7 @@ def main():
     # 当使用量化模型时，模型已经通过device_map="auto"分配到设备
     # 需要禁用accelerate的设备管理以避免冲突
     use_accelerate = False
-    accelerator = None
+    # accelerator = None
 
     if quantization_config is not None:
         # 量化模型已经通过device_map="auto"分配到设备，不使用accelerate
@@ -511,22 +512,42 @@ def main():
 
         # 应用Chat Template并重新Tokenize
         if "Instruct" in args.LLM_path or "Chat" in args.LLM_path:
-            # 构建对话格式
-            new_source_txt = []
-            for s in source_txt:
-                messages = [
-                    {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": s}
-                ]
-                text = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True
-                )
-                new_source_txt.append(text)
+            # 如果原始文本已经包含 <|im_start|> / <|im_end|> 等标记，则视为已构造好对话格式，直接使用
+            contains_chat_tokens = any("<|im_start|>" in s or "<|im_end|>" in s for s in source_txt)
+            if not contains_chat_tokens:
+                # 构建对话格式，并保留原始翻译指令（避免丢失翻译目标）
+                def _strip_chat_tokens(text: str) -> str:
+                    # 去除 <|im_start|> 和 <|im_end|> 相关标记，保留纯文本指令
+                    return (
+                        text.replace("<|im_start|>system", "")
+                        .replace("<|im_start|>user", "")
+                        .replace("<|im_start|>assistant", "")
+                        .replace("<|im_end|>", "")
+                        .strip()
+                    )
 
-            # 使用新文本覆盖
-            source_txt = new_source_txt
+                system_prompt = _strip_chat_tokens(params.Instruct) or "You are a helpful assistant."
+
+                new_source_txt = []
+                for s in source_txt:
+                    # 在用户输入末尾增加一段强引导，防止 H2O 压缩导致上下文丢失后模型遗忘指令
+                    # 这对于长文本 + 小预算场景（A级论文实验）至关重要
+                    reinforced_s = s + "\n\nImportant: Please translate the above text into French immediately."
+                    # ========================================================
+
+                    messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": reinforced_s}  # 使用强化后的输入
+                    ]
+                    text = tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True  # 添加 assistant 起始提示
+                    )
+                    new_source_txt.append(text)
+
+                # 使用新文本覆盖
+                source_txt = new_source_txt
 
             # 重新tokenize
             inputs = tokenizer(
@@ -606,19 +627,18 @@ def main():
         inference_time = time.time() - start_time
         stats['inference_times'].append(inference_time)
 
-        # 解码输出
-        # [FIX] 核心修复：Batch模式下需要切除输入Prompt，Streaming模式通常不需要（但已做兼容）
+        # Batch 模式下，generate 返回 [Input + Output]
+        # 我们必须切掉 Input 部分，否则计算 BLEU 时会因为包含英文原文而导致分数极低（接近0）
+
         if inference_mode == "batch":
-            # Batch generate 返回 [Prompt + Response]
-            # 获取Prompt长度
             input_token_len = input_ids.shape[1]
-            # 截取 Response 部分
             generated_tokens = output_sequences[0][input_token_len:]
         else:
-            # Streaming generate 通常只返回生成的 Token
+            # Streaming 模式通常只返回生成的 token
             generated_tokens = output_sequences[0]
 
         output_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        # ==============================================================
 
         target_txt_lt.extend(target_txt)
         output_text_lt.extend([output_text])
