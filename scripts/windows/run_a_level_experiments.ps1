@@ -9,11 +9,11 @@ $MODEL_PATH = ".\models\Qwen2.5-3B-Instruct"
 $BASE_OUTPUT_DIR = ".\output_logs\a_level_paper"
 $PARAMS = ".\StreamingLLM_GPE\configs\params_qwen_inference.json"
 $WAIT_K = 5
-$TOTAL_BUDGET = 512   # 更小预算以触发压缩
+$TOTAL_BUDGET = 512   # 默认测试预算
 $MAX_MEMORY_GB = 20.0  # 24GB显存，留4GB缓冲
 
 # 实验配置
-$MAX_SAMPLES = 50   # 控制运行时间
+$MAX_SAMPLES = 50   # 正式实验建议 50-100，测试可改为 2-5
 $MIN_SOURCE_LENGTH = 20
 
 # 长序列测试配置
@@ -27,6 +27,7 @@ Write-Host "GPU: RTX 4090 (24GB)"
 Write-Host "Model: $MODEL_NAME"
 Write-Host "Max Samples: $MAX_SAMPLES"
 Write-Host "Output: $BASE_OUTPUT_DIR"
+Write-Host "Max New Tokens: 2048 (Fixed)"
 Write-Host ""
 
 # 创建输出目录
@@ -52,12 +53,12 @@ foreach ($seq_len in $LONG_SEQUENCE_LENGTHS) {
     Write-Host "----------------------------------------"
     Write-Host "Testing sequence length: $seq_len tokens"
     Write-Host "----------------------------------------"
-    
+
     # Calculate min_source_length
     $min_length = [math]::Floor($seq_len / 100)
     if ($min_length -lt 10) { $min_length = 10 }
     if ($min_length -gt 50) { $min_length = 50 }
-    
+
     # 1. Baseline (GPE)
     Write-Host "[1/5] Running Baseline (GPE)..."
     python StreamingLLM_GPE/evaluate/multi_model_eval.py `
@@ -69,8 +70,8 @@ foreach ($seq_len in $LONG_SEQUENCE_LENGTHS) {
         --params $PARAMS `
         --min_source_length $min_length `
         --max_samples $MAX_SAMPLES `
-        --max_new_tokens 512
-    
+        --max_new_tokens 2048
+
     # 2. H2O Baseline (if implemented)
     if (Test-Path "StreamingLLM_GPE\baselines\h2o_cache.py") {
         Write-Host "[2/5] Running H2O Baseline..."
@@ -86,11 +87,11 @@ foreach ($seq_len in $LONG_SEQUENCE_LENGTHS) {
             --params $PARAMS `
             --min_source_length $min_length `
             --max_samples $MAX_SAMPLES `
-            --max_new_tokens 512
+            --max_new_tokens 2048
     } else {
         Write-Host "[2/5] Skipping H2O (not implemented yet)"
     }
-    
+
     # 3. StreamingLLM Baseline (if implemented)
     if (Test-Path "StreamingLLM_GPE\baselines\streamingllm_cache.py") {
         Write-Host "[3/5] Running StreamingLLM Baseline..."
@@ -106,11 +107,11 @@ foreach ($seq_len in $LONG_SEQUENCE_LENGTHS) {
             --params $PARAMS `
             --min_source_length $min_length `
             --max_samples $MAX_SAMPLES `
-            --max_new_tokens 512
+            --max_new_tokens 2048
     } else {
         Write-Host "[3/5] Skipping StreamingLLM (not implemented yet)"
     }
-    
+
     # 4. Head-Aware
     Write-Host "[4/5] Running Head-Aware..."
     python StreamingLLM_GPE/evaluate/multi_model_eval.py `
@@ -125,8 +126,8 @@ foreach ($seq_len in $LONG_SEQUENCE_LENGTHS) {
         --params $PARAMS `
         --min_source_length $min_length `
         --max_samples $MAX_SAMPLES `
-        --max_new_tokens 512
-    
+        --max_new_tokens 2048
+
     # 5. Full (Head-Aware + Group-Aware)
     Write-Host "[5/5] Running Full (Head-Aware + Group-Aware)..."
     python StreamingLLM_GPE/evaluate/multi_model_eval.py `
@@ -142,8 +143,8 @@ foreach ($seq_len in $LONG_SEQUENCE_LENGTHS) {
         --params $PARAMS `
         --min_source_length $min_length `
         --max_samples $MAX_SAMPLES `
-        --max_new_tokens 512
-    
+        --max_new_tokens 2048
+
     Write-Host ""
 }
 
@@ -160,7 +161,7 @@ foreach ($budget in $BUDGETS) {
     Write-Host "----------------------------------------"
     Write-Host "Testing budget: $budget tokens/layer"
     Write-Host "----------------------------------------"
-    
+
     python StreamingLLM_GPE/evaluate/multi_model_eval.py `
         --LLM_backbone $MODEL_NAME `
         --LLM_path $MODEL_PATH `
@@ -174,8 +175,8 @@ foreach ($budget in $BUDGETS) {
         --params $PARAMS `
         --min_source_length $MIN_SOURCE_LENGTH `
         --max_samples $MAX_SAMPLES `
-        --max_new_tokens 512
-    
+        --max_new_tokens 2048
+
     Write-Host ""
 }
 
@@ -207,7 +208,7 @@ python StreamingLLM_GPE/evaluate/multi_model_eval.py `
     --params $PARAMS `
     --min_source_length $min_length `
         --max_samples $MAX_SAMPLES `
-        --max_new_tokens 512
+        --max_new_tokens 2048
 
 # 2. Head-Aware only
 Write-Host "2. Head-Aware only..."
@@ -223,7 +224,7 @@ python StreamingLLM_GPE/evaluate/multi_model_eval.py `
     --params $PARAMS `
     --min_source_length $min_length `
     --max_samples $MAX_SAMPLES `
-    --max_new_tokens 512
+    --max_new_tokens 2048
 
 # 3. Group-Aware only
 Write-Host "3. Group-Aware only..."
@@ -239,7 +240,7 @@ python StreamingLLM_GPE/evaluate/multi_model_eval.py `
     --params $PARAMS `
     --min_source_length $min_length `
     --max_samples $MAX_SAMPLES `
-    --max_new_tokens 512
+    --max_new_tokens 2048
 
 # 4. Full
 Write-Host "4. Full (Head-Aware + Group-Aware)..."
@@ -256,7 +257,7 @@ python StreamingLLM_GPE/evaluate/multi_model_eval.py `
     --params $PARAMS `
     --min_source_length $min_length `
     --max_samples $MAX_SAMPLES `
-    --max_new_tokens 512
+    --max_new_tokens 2048
 
 # ============================================
 # Phase 4: 结果分析和汇总
@@ -299,4 +300,3 @@ Write-Host "========================================="
 Write-Host ""
 Write-Host "Results saved to: $BASE_OUTPUT_DIR"
 Write-Host ""
-
