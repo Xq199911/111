@@ -46,7 +46,7 @@ python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/s
 # 2. 下载模型
 .\scripts\windows\download_models.ps1
 
-# 3. 运行实验
+# 3. 运行实验                                                                                                                                 
 .\scripts\windows\run_a_level_experiments.ps1
 ```
 

@@ -510,63 +510,65 @@ def main():
         source_txt = batch.get("source_txt", None)
         target_txt = batch.get("target_txt", None)
 
-        # 应用Chat Template并重新Tokenize
+        # ================= [关键修复: 手动构建 Prompt 以保持流式对齐] =================
         if "Instruct" in args.LLM_path or "Chat" in args.LLM_path:
-            # 如果原始文本已经包含 <|im_start|> / <|im_end|> 等标记，则视为已构造好对话格式，直接使用
-            contains_chat_tokens = any("<|im_start|>" in s or "<|im_end|>" in s for s in source_txt)
-            if not contains_chat_tokens:
-                # 构建对话格式，并保留原始翻译指令（避免丢失翻译目标）
-                def _strip_chat_tokens(text: str) -> str:
-                    # 去除 <|im_start|> 和 <|im_end|> 相关标记，保留纯文本指令
-                    return (
-                        text.replace("<|im_start|>system", "")
-                        .replace("<|im_start|>user", "")
-                        .replace("<|im_start|>assistant", "")
-                        .replace("<|im_end|>", "")
-                        .strip()
-                    )
+            # 1. 获取原始的 input_ids (对应 source_seg_len)
+            original_input_ids = batch.get("source_tokens").to(device)
 
-                system_prompt = _strip_chat_tokens(params.Instruct) or "You are a helpful assistant."
+            # 2. 定义 System Prompt 和 强制翻译指令
+            system_content = params.Instruct if params.Instruct else "You are a helpful assistant."
+            # 在 User 输入后加强指令，防止模型遗忘
+            user_suffix_text = "\n\nImportant: Please translate the above text into French immediately."
 
-                new_source_txt = []
-                for s in source_txt:
-                    # 在用户输入末尾增加一段强引导，防止 H2O 压缩导致上下文丢失后模型遗忘指令
-                    # 这对于长文本 + 小预算场景（A级论文实验）至关重要
-                    reinforced_s = s + "\n\nImportant: Please translate the above text into French immediately."
-                    # ========================================================
+            # 3. 手动构建前缀和后缀 (适配 Qwen/ChatML 格式)
+            # 注意: 如果换用 Llama-3，需要改为 <|begin_of_text|>...<|start_header_id|>...
+            prefix_str = f"<|im_start|>system\n{system_content}<|im_end|>\n<|im_start|>user\n"
+            suffix_str = f"{user_suffix_text}<|im_end|>\n<|im_start|>assistant\n"
 
-                    messages = [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": reinforced_s}  # 使用强化后的输入
-                    ]
-                    text = tokenizer.apply_chat_template(
-                        messages,
-                        tokenize=False,
-                        add_generation_prompt=True  # 添加 assistant 起始提示
-                    )
-                    new_source_txt.append(text)
+            # 4. Tokenize 前缀和后缀
+            prefix_tokens = tokenizer(prefix_str, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+            suffix_tokens = tokenizer(suffix_str, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
 
-                # 使用新文本覆盖
-                source_txt = new_source_txt
+            # 5. 拼接: [Prefix] + [Original Source] + [Suffix]
+            # 这样中间的 [Original Source] 依然保持原样，不会破坏 source_seg_len 的对应关系
+            new_input_ids = torch.cat([prefix_tokens, original_input_ids, suffix_tokens], dim=1)
 
-            # 重新tokenize
-            inputs = tokenizer(
-                source_txt,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=32000  # 设置一个安全上限
-            )
-            input_ids = inputs.input_ids
-            attention_mask = inputs.attention_mask
+            # 6. 更新 batch
+            batch["source_tokens"] = new_input_ids
+            batch["attention_mask"] = torch.ones_like(new_input_ids)
 
-            # 更新 batch 中的长度信息
-            batch["source_tokens"] = input_ids
-            batch["attention_mask"] = attention_mask
+            # 7. [最关键的一步] 更新 source_seg_len
+            # 将前缀长度加到第一个词上，后缀长度加到最后一个词上
+            if "_lengths" in batch:
+                # 获取源文本分段长度列表
+                seg_lens = batch["_lengths"][0]["source_seg_len"]
+
+                # 修改第一个词的长度：模型读第一个词时，会连同 System Prompt 一起读入
+                seg_lens[0] += prefix_tokens.shape[1]
+
+                # 修改最后一个词的长度：模型读完最后词时，会连同 Assistant Prompt 一起读入
+                seg_lens[-1] += suffix_tokens.shape[1]
+
+                # 显式写回
+                batch["_lengths"][0]["source_seg_len"] = seg_lens
+
+            # 调试打印 (仅第一次)
+            if step == 0:
+                print(f"\n[FIX DEBUG] Chat Template Applied Correctly:")
+                print(f"  Prefix Length: {prefix_tokens.shape[1]}")
+                print(f"  Original Length: {original_input_ids.shape[1]}")
+                print(f"  Suffix Length: {suffix_tokens.shape[1]}")
+                print(f"  New Total Length: {new_input_ids.shape[1]}")
+                print(f"  Updated source_seg_len[0]: {batch['_lengths'][0]['source_seg_len'][0]}")
+
+            # 更新 input_ids 变量供后续使用
+            input_ids = new_input_ids
+            attention_mask = batch["attention_mask"]
         else:
-            # 非Chat模型，使用原始input_ids
+            # 非Chat模型，保持原样
             input_ids = batch.get("source_tokens", None)
             attention_mask = batch.get("attention_mask", None)
+        # ==========================================================================
 
         _lengths = batch.get("_lengths", None)
         inference_mode = batch.get("inference_mode", "streaming")
