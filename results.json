@@ -1,11 +1,11 @@
 {
   "model_architecture": "Qwen",
   "model_path": ".\\models\\Qwen2.5-3B-Instruct",
-  "bleu_score": 17.888648591173734,
+  "bleu_score": 21.92545459892508,
   "memory_stats": {
-    "peak_memory_gb": 5.854067802429199,
-    "avg_memory_gb": 5.854040145874023,
-    "final_memory_gb": 5.854040145874023
+    "peak_memory_gb": 5.854097366333008,
+    "avg_memory_gb": 5.85408353805542,
+    "final_memory_gb": 5.85408353805542
   },
   "cache_stats": {
     "avg_cache_memory_gb": 0,
@@ -17,7 +17,7 @@
     "avg_length": 2048.0
   },
   "latency_stats": {
-    "avg_inference_time": 160.37709069252014
+    "avg_inference_time": 160.58770370483398
   },
   "streaming_stats": {}
 }

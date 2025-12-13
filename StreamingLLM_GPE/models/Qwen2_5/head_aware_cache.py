@@ -357,7 +357,8 @@ class HeadAwareDynamicCache(DynamicCache):
         # 这里如果 evict_by_groups 是物理移除，不需要修改 seen_tokens，
         # 除非你的模型依赖 seen_tokens 来计算 Attention Mask 的大小。
         # 暂时保持原逻辑：
-        # evicted_count = evict_end - evict_start
+        # evicted_count = evict_end - evict_
+        # start
         # self._seen_tokens -= evicted_count
 
     def get_memory_usage(self) -> float:
