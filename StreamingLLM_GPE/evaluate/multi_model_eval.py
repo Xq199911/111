@@ -5,11 +5,9 @@
 """
 import os
 import sys
-
 os.environ["USE_TF"] = "0"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 # ============================================
-
 # 禁用HuggingFace数据集缓存，确保使用最新的数据文件
 os.environ["HF_DATASETS_DISABLE_CACHE"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -161,10 +159,6 @@ def create_cache(head_analyzer, group_tracker, args, model_name='Qwen'):
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
 
     # ================= [关键修复 1] 增加 Sink Tokens =================
-    # 将 sink_tokens 从 4 增加到 128
-    # 这是为了防止在处理长文本时，H2O 为了节省空间把开头的 System Prompt（翻译指令）删掉
-    # 删掉指令后，模型就会忘记自己是在做翻译，变成做阅读理解
-
     if args.use_h2o:
         try:
             from StreamingLLM_GPE.baselines.h2o_cache import H2OCache
@@ -261,7 +255,6 @@ def main():
     )
 
     # 记录配置
-    # 确定显示的预算值
     if args.use_h2o:
         budget_display = f"{args.h2o_budget} tokens/layer (H2O)"
     elif args.use_streamingllm:
@@ -305,7 +298,6 @@ def main():
     torch_dtype = torch.bfloat16
 
     if args.quantization == "4bit":
-        # 4-bit量化：最小显存占用
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
@@ -313,14 +305,12 @@ def main():
             bnb_4bit_quant_type="nf4"
         )
     elif args.quantization == "8bit":
-        # 8-bit量化：平衡性能和显存
         quantization_config = BitsAndBytesConfig(
             load_in_8bit=True,
             llm_int8_threshold=6.0,
             llm_int8_has_fp16_weight=False
         )
     elif args.quantization == "none":
-        # 无量化：最佳性能，需要更多显存
         quantization_config = None
         torch_dtype = torch.bfloat16
 
@@ -352,7 +342,6 @@ def main():
         model, config, args
     )
 
-    # 如果启用Head-Aware，预分析heads（可选）
     if args.use_head_aware and args.analyze_heads:
         print("Analyzing head functionality...")
         logging.info("Head analysis will be performed during inference")
@@ -375,17 +364,13 @@ def main():
     )
 
     data_collator_dataset = data_collator.dataset_loader()
-
-    # 记录初始数据集大小
     initial_size = len(data_collator_dataset)
     logging.info(f"Loaded dataset with {initial_size} samples from {params.file_path}")
 
     if initial_size == 0:
         logging.error(f"No samples found in data file: {params.file_path}")
-        raise ValueError(
-            f"No samples available in data file: {params.file_path}. Please check the file path and format.")
+        raise ValueError(f"No samples available in data file: {params.file_path}.")
 
-    # 过滤短序列（如果指定了最小长度）
     if args.min_source_length > 0:
         def filter_long_sequences(example):
             source_txt = example.get("source_txt", "")
@@ -401,12 +386,10 @@ def main():
             f"Filtered dataset: {before_filter_size} -> {after_filter_size} samples (keeping sequences with >= {args.min_source_length} source words)")
 
         if after_filter_size == 0:
-            # 提供更详细的诊断信息
             logging.warning(f"All samples were filtered out! Checking sample lengths...")
-            # 检查前几个样本的长度
             sample_lengths = []
             for i, example in enumerate(data_collator.dataset_loader()):
-                if i >= 5:  # 只检查前5个样本
+                if i >= 5:
                     break
                 source_txt = example.get("source_txt", "")
                 if source_txt:
@@ -426,11 +409,8 @@ def main():
 
             raise ValueError(
                 f"No samples available after filtering with min_source_length={args.min_source_length}. "
-                f"Original dataset size: {before_filter_size}. "
-                f"Try reducing --min_source_length or check your data file."
             )
 
-    # 限制样本数量（用于测试）
     original_size = len(data_collator_dataset)
     if args.max_samples is not None and args.max_samples > 0:
         data_collator_dataset = data_collator_dataset.select(range(min(args.max_samples, len(data_collator_dataset))))
@@ -447,41 +427,29 @@ def main():
         collate_fn=data_collator.collate_fn_inference
     )
 
-    # 设置环境变量避免tensorflow和tokenizers冲突
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # 禁用tensorflow警告
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-    # 当使用量化模型时，模型已经通过device_map="auto"分配到设备
-    # 需要禁用accelerate的设备管理以避免冲突
     use_accelerate = False
-    # accelerator = None
-
     if quantization_config is not None:
-        # 量化模型已经通过device_map="auto"分配到设备，不使用accelerate
         stream_model = model
-        # 获取模型所在的设备
         try:
             device = next(model.parameters()).device
         except:
-            # 如果无法获取，使用默认设备
             device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() and args.device >= 0 else "cpu")
     else:
-        # 非量化模型使用accelerate
         accelerator = Accelerator(mixed_precision="bf16")
         stream_model, dataloader = accelerator.prepare(model, dataloader)
         device = accelerator.device
         use_accelerate = True
 
-    # 评估指标
     target_txt_lt = []
     output_text_lt = []
     AL = []
     LAAL = []
 
-    # 内存监控
     memory_monitor = MemoryMonitor(device=args.device)
 
-    # 统计信息
     stats = {
         'total_tokens': 0,
         'max_length': 0,
@@ -496,12 +464,10 @@ def main():
         # 创建cache（在generate之前设置）
         if args.use_head_aware:
             cache = create_cache(head_analyzer, group_tracker, args, args.LLM_backbone)
-            # 设置source和target cache
             stream_model.source_key_values = cache
             stream_model.target_key_values = create_cache(head_analyzer, group_tracker, args, args.LLM_backbone)
             stream_model.past_key_values = create_cache(head_analyzer, group_tracker, args, args.LLM_backbone)
         else:
-            # 根据模型类型创建DynamicCache
             stream_model.source_key_values = create_cache(head_analyzer, group_tracker, args, args.LLM_backbone)
             stream_model.target_key_values = create_cache(head_analyzer, group_tracker, args, args.LLM_backbone)
             stream_model.past_key_values = create_cache(head_analyzer, group_tracker, args, args.LLM_backbone)
@@ -509,79 +475,76 @@ def main():
         # 获取原始文本
         source_txt = batch.get("source_txt", None)
         target_txt = batch.get("target_txt", None)
-
-        # ================= [关键修复: 手动构建 Prompt 以保持流式对齐] =================
-        if "Instruct" in args.LLM_path or "Chat" in args.LLM_path:
-            # 1. 获取原始的 input_ids (对应 source_seg_len)
-            original_input_ids = batch.get("source_tokens").to(device)
-
-            # 2. 定义 System Prompt 和 强制翻译指令
-            system_content = params.Instruct if params.Instruct else "You are a helpful assistant."
-            # 在 User 输入后加强指令，防止模型遗忘
-            user_suffix_text = "\n\nImportant: Please translate the above text into French immediately."
-
-            # 3. 手动构建前缀和后缀 (适配 Qwen/ChatML 格式)
-            # 注意: 如果换用 Llama-3，需要改为 <|begin_of_text|>...<|start_header_id|>...
-            prefix_str = f"<|im_start|>system\n{system_content}<|im_end|>\n<|im_start|>user\n"
-            suffix_str = f"{user_suffix_text}<|im_end|>\n<|im_start|>assistant\n"
-
-            # 4. Tokenize 前缀和后缀
-            prefix_tokens = tokenizer(prefix_str, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-            suffix_tokens = tokenizer(suffix_str, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-
-            # 5. 拼接: [Prefix] + [Original Source] + [Suffix]
-            # 这样中间的 [Original Source] 依然保持原样，不会破坏 source_seg_len 的对应关系
-            new_input_ids = torch.cat([prefix_tokens, original_input_ids, suffix_tokens], dim=1)
-
-            # 6. 更新 batch
-            batch["source_tokens"] = new_input_ids
-            batch["attention_mask"] = torch.ones_like(new_input_ids)
-
-            # 7. [最关键的一步] 更新 source_seg_len
-            # 将前缀长度加到第一个词上，后缀长度加到最后一个词上
-            if "_lengths" in batch:
-                # 获取源文本分段长度列表
-                seg_lens = batch["_lengths"][0]["source_seg_len"]
-
-                # 修改第一个词的长度：模型读第一个词时，会连同 System Prompt 一起读入
-                seg_lens[0] += prefix_tokens.shape[1]
-
-                # 修改最后一个词的长度：模型读完最后词时，会连同 Assistant Prompt 一起读入
-                seg_lens[-1] += suffix_tokens.shape[1]
-
-                # 显式写回
-                batch["_lengths"][0]["source_seg_len"] = seg_lens
-
-            # 调试打印 (仅第一次)
-            if step == 0:
-                print(f"\n[FIX DEBUG] Chat Template Applied Correctly:")
-                print(f"  Prefix Length: {prefix_tokens.shape[1]}")
-                print(f"  Original Length: {original_input_ids.shape[1]}")
-                print(f"  Suffix Length: {suffix_tokens.shape[1]}")
-                print(f"  New Total Length: {new_input_ids.shape[1]}")
-                print(f"  Updated source_seg_len[0]: {batch['_lengths'][0]['source_seg_len'][0]}")
-
-            # 更新 input_ids 变量供后续使用
-            input_ids = new_input_ids
-            attention_mask = batch["attention_mask"]
-        else:
-            # 非Chat模型，保持原样
-            input_ids = batch.get("source_tokens", None)
-            attention_mask = batch.get("attention_mask", None)
-        # ==========================================================================
-
         _lengths = batch.get("_lengths", None)
         inference_mode = batch.get("inference_mode", "streaming")
         split_mode = batch.get("split_mode", None)
         _lengths_index = batch.get("_lengths_index", None)
         wait_k = batch.get("wait_k", None)
         assistant_token = batch.get("assistant_token", None)
+        # ==============================================================================
+        if "Instruct" in args.LLM_path or "Chat" in args.LLM_path:
+            # 1. 获取原始的 input_ids
+            original_input_ids = batch.get("source_tokens").to(device)
+
+            # 2. 定义 Prompt 组件
+            system_content = params.Instruct if params.Instruct else "You are a helpful assistant."
+            user_suffix_text = "\n\nImportant: Please translate the above text into French immediately."
+
+            # 3. 构建前缀和后缀
+            prefix_str = f"<|im_start|>system\n{system_content}<|im_end|>\n<|im_start|>user\n"
+            suffix_str = f"{user_suffix_text}<|im_end|>\n<|im_start|>assistant\n"
+
+            # 4. Tokenize
+            prefix_tokens = tokenizer(prefix_str, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+            suffix_tokens = tokenizer(suffix_str, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+
+            # 5. 根据模式处理
+            if inference_mode == "streaming":
+                # [STREAMING MODE]: Suffix 放入 assistant_token
+                new_input_ids = torch.cat([prefix_tokens, original_input_ids], dim=1)
+                batch["assistant_token"] = suffix_tokens.squeeze(0)
+                assistant_token = batch["assistant_token"] # 同步更新本地变量
+
+                batch["source_tokens"] = new_input_ids
+                batch["attention_mask"] = torch.ones_like(new_input_ids)
+
+                if "_lengths" in batch:
+                    seg_lens = batch["_lengths"][0]["source_seg_len"]
+                    seg_lens[0] += prefix_tokens.shape[1]
+                    batch["_lengths"][0]["source_seg_len"] = seg_lens
+            else:
+                # [BATCH MODE]: 全部拼接
+                new_input_ids = torch.cat([prefix_tokens, original_input_ids, suffix_tokens], dim=1)
+                batch["source_tokens"] = new_input_ids
+                batch["attention_mask"] = torch.ones_like(new_input_ids)
+
+                if "_lengths" in batch:
+                    seg_lens = batch["_lengths"][0]["source_seg_len"]
+                    seg_lens[0] += prefix_tokens.shape[1]
+                    seg_lens[-1] += suffix_tokens.shape[1]
+                    batch["_lengths"][0]["source_seg_len"] = seg_lens
+
+            input_ids = batch["source_tokens"]
+            attention_mask = batch["attention_mask"]
+
+            # 调试打印 (仅第一次)
+            if step == 0:
+                print(f"\n[FIX DEBUG] Mode: {inference_mode}")
+                print(f"  Prefix Length: {prefix_tokens.shape[1]}")
+                print(f"  Suffix Length: {suffix_tokens.shape[1]}")
+                print(f"  Total Input Length: {new_input_ids.shape[1]}")
+
+        else:
+            # 非Chat模型，保持原样
+            input_ids = batch.get("source_tokens", None)
+            attention_mask = batch.get("attention_mask", None)
+        # ==========================================================================
 
         # 记录内存
         memory_monitor.record()
 
         # 添加调试信息
-        if step == 0 or step < 3:  # 只打印前几个样本的详细信息
+        if step == 0 or step < 3:
             source_text_full = source_txt[0] if source_txt and len(source_txt) > 0 else 'N/A'
             source_words = source_text_full.split() if source_text_full != 'N/A' else []
             source_word_count = len(source_words)
@@ -590,11 +553,8 @@ def main():
             logging.info(
                 f"  Source text (first 200 chars): {source_text_full[:200] if source_text_full != 'N/A' else 'N/A'}...")
             logging.info(f"  Source length: {source_word_count} words")
-
             logging.info(f"  Input IDs shape: {input_ids.shape}")
-            logging.info(f"  Max new tokens: {args.max_new_tokens}")
 
-            # 打印到控制台
             print(f"\n[DEBUG] Sample {step}:")
             print(f"  Source length: {source_word_count} words")
             if source_word_count > 1000:
@@ -629,50 +589,38 @@ def main():
         inference_time = time.time() - start_time
         stats['inference_times'].append(inference_time)
 
-        # Batch 模式下，generate 返回 [Input + Output]
-        # 我们必须切掉 Input 部分，否则计算 BLEU 时会因为包含英文原文而导致分数极低（接近0）
-
         if inference_mode == "batch":
             input_token_len = input_ids.shape[1]
             generated_tokens = output_sequences[0][input_token_len:]
         else:
-            # Streaming 模式通常只返回生成的 token
             generated_tokens = output_sequences[0]
 
         output_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-        # ==============================================================
 
         target_txt_lt.extend(target_txt)
         output_text_lt.extend([output_text])
 
-        # 添加调试信息（文件 + 控制台）
-        if step == 0 or step < 3:  # 只打印前几个样本的详细信息
+        # 添加调试信息
+        if step == 0 or step < 3:
             logging.info(f"[DEBUG] Sample {step} output:")
             logging.info(f"  Output length: {len(generated_tokens)} tokens")
             logging.info(f"  Output text (first 500 chars): {output_text[:500]}...")
-            logging.info(f"  Target text (first 500 chars): {target_txt[0][:500] if target_txt else ''}...")
-
             print(f"\n[DEBUG] Sample {step} output:")
             print(f"  Output length: {len(generated_tokens)} tokens")
             print(f"  Output text (first 300 chars): {output_text[:300]}...")
             if target_txt:
                 print(f"  Target text (first 300 chars): {target_txt[0][:300]}")
 
-        # 记录统计信息
         seq_len = len(generated_tokens)
         stats['total_tokens'] += seq_len
         stats['max_length'] = max(stats['max_length'], seq_len)
 
-        # 记录cache内存
         if args.use_head_aware:
-            # 检查是否是HeadAwareCache（可能是Qwen、Llama或Gemma的实现）
             if hasattr(stream_model.source_key_values, 'get_memory_usage'):
                 cache_memory = stream_model.source_key_values.get_memory_usage()
                 stats['cache_memory_gb'].append(cache_memory)
 
-        # 检查预算（如果启用）
         if args.use_head_aware and budget_monitor is not None:
-            # 检查是否是HeadAwareCache（可能是Qwen、Llama或Gemma的实现）
             if hasattr(stream_model.source_key_values, 'get_memory_usage'):
                 budget_monitor.check_and_evict(
                     stream_model.source_key_values,
@@ -680,7 +628,6 @@ def main():
                 )
 
         if inference_mode == "streaming":
-            # 延迟计算（使用与head_aware_eval.py相同的逻辑）
             source_txt_words = source_txt[0].split() if source_txt and len(source_txt) > 0 else []
             output_text_words = output_text.split()
 
@@ -721,7 +668,6 @@ def main():
                 AL.append(0)
                 LAAL.append(0)
 
-        # 打印进度（不使用accelerate.is_main_process，因为量化模型可能不使用accelerate）
         if step % 10 == 0 or step == len(dataloader) - 1:
             print(f"\n[{args.LLM_backbone}] Step {step}:")
             print(f"  Output Length: {seq_len} tokens")
@@ -745,7 +691,6 @@ def main():
             output_text_lt = output_text_lt[:min_len]
             target_txt_lt = target_txt_lt[:min_len]
 
-            # 记录前几个样本用于调试
             logging.info(f"\n=== BLEU Calculation Debug ===")
             logging.info(f"Number of samples: {len(output_text_lt)}")
             for i in range(min(3, len(output_text_lt))):
@@ -760,11 +705,8 @@ def main():
                 logging.info(f"BLEU score: {bleu_score:.2f}")
             except Exception as e:
                 logging.error(f"Failed to calculate BLEU: {e}")
-                logging.error(f"Output texts count: {len(output_text_lt)}")
-                logging.error(f"Target texts count: {len(target_txt_lt)}")
                 bleu_score = 0.0
 
-    # 内存统计
     memory_stats = memory_monitor.get_stats()
     logging.info(f"Peak GPU Memory: {memory_stats['peak_memory_gb']:.2f}GB")
     logging.info(f"Average GPU Memory: {memory_stats['avg_memory_gb']:.2f}GB")
@@ -782,7 +724,6 @@ def main():
         logging.info(f"Average AL: {avg_AL:.2f}")
         logging.info(f"Average LAAL: {avg_LAAL:.2f}")
 
-    # 保存结果
     results = {
         'model_architecture': args.LLM_backbone,
         'model_path': args.LLM_path,
